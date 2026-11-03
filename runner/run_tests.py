@@ -45,9 +45,40 @@ def safe_extract(tgz, dest):
             with tf.extractfile(m) as src, open(target, "wb") as out: shutil.copyfileobj(src, out)
             os.chmod(target, 0o755 if m.mode & 0o111 else 0o644)
 
+def unescape_mp(s): return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+def confine_plan(mountinfo, rw):
+    """mount points to remount read-only: every mount in this namespace except the two writable candidate mounts; the root mount must be among them"""
+    mps = []
+    for line in mountinfo.splitlines():
+        f = line.split(" ")
+        if len(f) > 5: mps.append(unescape_mp(f[4]))
+    return [m for m in dict.fromkeys(mps) if m not in rw]
+
+def cmd_confine(a):
+    """runs as root inside `unshare --net --mount`: bind the candidate's tree and home as the only writable mounts, remount every other mount read-only, self-check, then exec the unprivileged command (fails closed)"""
+    rw = [os.path.realpath(a.tree), os.path.realpath(a.home)]
+    def mnt(*args): return subprocess.run(["/usr/bin/mount" if os.path.exists("/usr/bin/mount") else "mount"] + list(args), stdin=subprocess.DEVNULL, capture_output=True)
+    for d in rw:
+        if mnt("--bind", d, d).returncode: print("CONFINE_FAIL bind", d); sys.exit(97)
+    todo = confine_plan(open("/proc/self/mountinfo").read(), rw)
+    if "/" not in todo: print("CONFINE_FAIL no root mount"); sys.exit(97)
+    for m in todo:
+        if mnt("-o", "remount,bind,ro", m).returncode and m == "/": print("CONFINE_FAIL remount /"); sys.exit(97)
+    for probe in ("/", "/usr/local/bin", "/tmp", "/etc"):   # root itself must now be refused by the kernel (EROFS)
+        if os.path.isdir(probe) and probe not in rw:
+            try: open(os.path.join(probe, ".confine-%d" % os.getpid()), "w").close(); os.remove(os.path.join(probe, ".confine-%d" % os.getpid())); print("CONFINE_FAIL writable", probe); sys.exit(97)
+            except OSError: pass
+    for d in rw:
+        try: open(os.path.join(d, ".confine-%d" % os.getpid()), "w").close(); os.remove(os.path.join(d, ".confine-%d" % os.getpid()))
+        except OSError: print("CONFINE_FAIL candidate dir not writable", d); sys.exit(97)
+    cmd = a.rest[1:] if a.rest and a.rest[0] == "--" else a.rest
+    if not cmd: print("CONFINE_FAIL no command"); sys.exit(97)
+    os.execvp(cmd[0], cmd)
+
 def sandbox_cmd(mode, argv, timeout, tree, home):
     if mode == "none": return list(argv)
-    return (["sudo", "-n", "unshare", "--net", "--", "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--no-new-privs", "env", "-i", "HOME=" + home, "TMPDIR=" + home,
+    return (["sudo", "-n", "unshare", "--net", "--mount", "--", sys.executable, "-I", os.path.abspath(__file__), "confine", "--tree", tree, "--home", home, "--", "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--no-new-privs", "env", "-i", "HOME=" + home, "TMPDIR=" + home,
              "PATH=/usr/local/bin:/usr/bin:/bin", "timeout", "-k", "5", str(timeout)] + list(argv))
 
 def tail_text(path):
@@ -116,4 +147,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); sp = ap.add_subparsers(dest="cmd", required=True)
     r = sp.add_parser("run"); r.add_argument("--records", required=True); r.add_argument("--out", required=True); r.add_argument("--sandbox", choices=["linux", "none"], default="linux")
     p = sp.add_parser("publish"); p.add_argument("--out", required=True); p.add_argument("--records", required=True)
-    a = ap.parse_args(); (cmd_run if a.cmd == "run" else cmd_publish)(a)
+    c = sp.add_parser("confine"); c.add_argument("--tree", required=True); c.add_argument("--home", required=True); c.add_argument("rest", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    {"run": cmd_run, "publish": cmd_publish, "confine": cmd_confine}[a.cmd](a)
