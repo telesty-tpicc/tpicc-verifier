@@ -25,7 +25,7 @@ def jload(path):
 def check_request(req, rid):
     if not isinstance(req, dict) or set(req) != REQ_KEYS or req["schema"] != "tpicc-test-request-v1" or req["id"] != rid: raise ValueError("malformed request")
     argv, t = req["argv"], req["timeout_s"]
-    if not (isinstance(argv, list) and 2 <= len(argv) <= 6 and argv[0] in ("php", "python3") and all(isinstance(a, str) and ARG_RE.match(a) for a in argv)): raise ValueError("argv outside policy")
+    if not (isinstance(argv, list) and 2 <= len(argv) <= 6 and argv[0] in ("php", "python3", "node") and (argv[0] != "node" or (len(argv) == 2 and re.fullmatch(r"[A-Za-z0-9._/-]+\.c?js", argv[1]) is not None)) and all(isinstance(a, str) and ARG_RE.match(a) for a in argv)): raise ValueError("argv outside policy")
     if any(a.startswith("-") or ".." in a.split("/") or a.startswith("/") for a in argv[1:]): raise ValueError("argv outside policy")
     if not (isinstance(t, int) and 10 <= t <= 300) or not SHA_RE.match(str(req["bundle_sha256"])): raise ValueError("timeout or digest invalid")
 

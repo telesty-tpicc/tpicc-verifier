@@ -200,7 +200,7 @@ class Verifier:
             if any(overlaps(e, d) for d in self.cfg["deny"]): raise Refuse("REFUSED_UNVERIFIABLE", "mission covers a class that is never eligible")
         if "test" in m:
             t = m["test"]; a = t.get("argv") if isinstance(t, dict) else None
-            if not (isinstance(t, dict) and set(t) == {"argv", "timeout_s"} and isinstance(a, list) and 2 <= len(a) <= 6 and a[0] in ("php", "python3") and all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9._/=-]{1,100}", x) for x in a)
+            if not (isinstance(t, dict) and set(t) == {"argv", "timeout_s"} and isinstance(a, list) and 2 <= len(a) <= 6 and a[0] in ("php", "python3", "node") and (a[0] != "node" or (len(a) == 2 and re.fullmatch(r"[A-Za-z0-9._/-]+\.c?js", a[1]) is not None)) and all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9._/=-]{1,100}", x) for x in a)
                     and not any(x.startswith("-") or x.startswith("/") or ".." in x.split("/") for x in a[1:]) and isinstance(t["timeout_s"], int) and 10 <= t["timeout_s"] <= 300
                     and any(under(a[1], p) for p in m["allow_paths"])):
                 raise Refuse("REFUSED_UNVERIFIABLE", "mission test command is outside policy")
