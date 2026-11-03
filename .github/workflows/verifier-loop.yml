@@ -1,4 +1,4 @@
-# DRAFT (unpublished). P2: the privileged workflow stays in the verifier-controlled PUBLIC repo; the agent holds no credential for this repo, so it cannot alter this file,
+# DRAFT (unpublished). P3 revision of the P2 file: action pinned to v3.2.0 with permission-contents: write on both working tokens. P2: the privileged workflow stays in the verifier-controlled PUBLIC repo; the agent holds no credential for this repo, so it cannot alter this file,
 # the verifier code, the trust anchor/pin, or any input of this job. Add via the GitHub web UI to telesty-tpicc/tpicc-verifier at .github/workflows/verifier-loop.yml
 # How it works: a run polls the private work repo for submit/* branches about every minute for ~40 minutes (GitHub App tokens last 1 hour), then starts the next run
 # with this repository's own GITHUB_TOKEN. No agent-controlled event, file or secret is involved in triggering. Hourly cron and manual Run are fallbacks only.
@@ -25,29 +25,31 @@ jobs:
         with:
           persist-credentials: false
       - id: org
-        uses: actions/create-github-app-token@af35edadc00be37caa72ed9f3e6d5f7801bfdf09  # v1.11.7
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ vars.VERIFIER_APP_ID }}
           private-key: ${{ secrets.VERIFIER_APP_KEY }}
           owner: telesty-tpicc
           repositories: tpicc-agent-work,tpicc-verifier,tpicc-mission-records
+          permission-contents: write
       - id: real
-        uses: actions/create-github-app-token@af35edadc00be37caa72ed9f3e6d5f7801bfdf09  # v1.11.7
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ vars.PROMOTER_APP_ID }}
           private-key: ${{ secrets.PROMOTER_APP_KEY }}
           owner: btsevers
           repositories: ${{ vars.REAL_REPO_NAME }}
+          permission-contents: write
       # Fail-closed scope assertions (replace screenshot checks). Unscoped tokens expose the FULL installation: the repository set must be exactly
       # what P1 specifies and the installation must hold no permission beyond contents. Prints PASS/FAIL only (public logs); no names, no values.
       - id: org_all
-        uses: actions/create-github-app-token@af35edadc00be37caa72ed9f3e6d5f7801bfdf09  # v1.11.7
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ vars.VERIFIER_APP_ID }}
           private-key: ${{ secrets.VERIFIER_APP_KEY }}
           owner: telesty-tpicc
       - id: real_all
-        uses: actions/create-github-app-token@af35edadc00be37caa72ed9f3e6d5f7801bfdf09  # v1.11.7
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ vars.PROMOTER_APP_ID }}
           private-key: ${{ secrets.PROMOTER_APP_KEY }}
@@ -56,6 +58,8 @@ jobs:
         env:
           ORG_TOKEN: ${{ steps.org_all.outputs.token }}
           REAL_TOKEN: ${{ steps.real_all.outputs.token }}
+          ORG_NARROW: ${{ steps.org.outputs.token }}
+          REAL_NARROW: ${{ steps.real.outputs.token }}
           REAL_REPO_NAME: ${{ vars.REAL_REPO_NAME }}
         run: |
           python3 - <<'PY'
@@ -71,9 +75,10 @@ jobs:
           if org != sorted(["tpicc-agent-work", "tpicc-mission-records", "tpicc-verifier"]): bad.append("org-repo-set")
           st, d = call("/installation/repositories?per_page=100", os.environ["REAL_TOKEN"])
           real = sorted(x["name"] for x in d.get("repositories", [])) if st == 200 else None
-          if real != [os.environ["REAL_REPO_NAME"]]: bad.append("promoter-repo-set")
+          if real != ["tpicc-standin"] or os.environ["REAL_REPO_NAME"] != "tpicc-standin": bad.append("promoter-repo-set")   # P3: hard-coded; the real TPICC repository must never be installed or named here
           # permission probes: each must be refused (403/404) for a contents-only installation
-          for tag, tok, repo in (("org", os.environ["ORG_TOKEN"], "telesty-tpicc/tpicc-agent-work"), ("promoter", os.environ["REAL_TOKEN"], "btsevers/" + os.environ["REAL_REPO_NAME"])):
+          for tag, tok, repo in (("org", os.environ["ORG_TOKEN"], "telesty-tpicc/tpicc-agent-work"), ("promoter", os.environ["REAL_TOKEN"], "btsevers/" + os.environ["REAL_REPO_NAME"]),
+                                  ("org-narrow", os.environ["ORG_NARROW"], "telesty-tpicc/tpicc-agent-work"), ("promoter-narrow", os.environ["REAL_NARROW"], "btsevers/" + os.environ["REAL_REPO_NAME"])):
               for probe in ("issues", "pulls", "actions/workflows", "actions/secrets", "hooks", "keys", "environments", "pages"):
                   code, _ = call("/repos/%s/%s" % (repo, probe), tok)
                   if code not in (403, 404): bad.append("%s-%s-%s" % (tag, probe.replace("/", "_"), code))
