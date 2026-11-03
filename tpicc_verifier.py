@@ -23,11 +23,15 @@ DEFAULT_CONFIG = {
     # files whose change between the signed baseline and the current head is material even if outside the footprint
     "enforcement": ["governance/", "AGENTS.md", "engineering/owner-approval/", "bin/owner-approve.php", "tools/verifier/"],
     "max_commits": 50, "max_files": 20, "max_blob": 262144, "max_validity_days": 7, "intent_ttl_s": 600,
+    "test_wait_s": 1800, "test_sandboxes": ["linux-unshare-net-nobody"],   # P3: how long to wait for the independent test result; runner sandbox modes the verifier accepts
 }
 
 def scrub(t):
     """remove credentials embedded in URLs from any text before it can reach an error message or log"""
     return re.sub(r"(://)[^/@\s]+@", r"\1***@", t)
+
+class Pending(Exception):
+    """the independent test result is not available yet: no verdict, no ledger entry, try again next cycle"""
 
 class Refuse(Exception):
     def __init__(self, code, reason, fixable=False):
@@ -152,14 +156,14 @@ def verify_sig(data, sig, signers, namespace, principal="owner"):
     finally: shutil.rmtree(d, ignore_errors=True)
 
 class Verifier:
-    def __init__(self, work, real, ledger, scratch, anchor_path, anchor_pin, config=None, allow_file=False, now=None, records=None, log=print):
+    def __init__(self, work, real, ledger, scratch, anchor_path, anchor_pin, config=None, allow_file=False, now=None, records=None, log=print, tester=None):
         self.cfg = dict(DEFAULT_CONFIG); self.cfg.update(config or {})
         self.scratch = scratch; os.makedirs(scratch, exist_ok=True)
         self.home = tempfile.mkdtemp(dir=scratch)   # empty HOME: no user/global git config, no credential helpers
         bare = os.path.join(scratch, "objects.git"); Git(None, self.home).run("init", "--bare", "-q", bare)
         self.g = Git(bare, self.home, allow_file=allow_file); self.work, self.real = work, real
         self.now = now or now_iso; self.ledger = Ledger(self.g, ledger, clock=self.now); self.anchor_path, self.anchor_pin = anchor_path, anchor_pin
-        self.records, self.log = records, log
+        self.records, self.log, self.tester = records, log, tester
     # ---- reading remote data as objects only ----
     def fetch(self, remote, ref, local):
         p = self.g.run("fetch", "--no-tags", "--no-recurse-submodules", "-q", remote, "+%s:%s" % (ref, local), ok_fail=True)
@@ -182,6 +186,7 @@ class Verifier:
         try: m = load_json(raw)
         except Exception: raise Refuse("REFUSED_UNVERIFIABLE", "mission is not valid JSON")
         need = {"schema", "handle", "work_order", "wo_path", "wo_sha256", "risk", "baseline", "allow_paths", "allowed_ops", "footprint", "max_attempts", "nonce", "issued_at", "expires_at"}
+        if isinstance(m, dict) and "test" in m: need = need | {"test"}   # P3: optional signed test command
         if not isinstance(m, dict) or set(m) != need or m["schema"] != "tpicc-mission-v1" or m["handle"] != handle or m["risk"] not in ("R1", "R2"):
             raise Refuse("REFUSED_UNVERIFIABLE", "mission malformed or ineligible risk class")
         if not (isinstance(m["allow_paths"], list) and m["allow_paths"] and all(isinstance(x, str) for x in m["allow_paths"]) and isinstance(m["footprint"], list)
@@ -193,6 +198,12 @@ class Verifier:
             if not isinstance(e, str) or norm_path_problem(e.rstrip("/")): raise Refuse("REFUSED_UNVERIFIABLE", "mission lists an unacceptable path")
         for e in m["allow_paths"]:
             if any(overlaps(e, d) for d in self.cfg["deny"]): raise Refuse("REFUSED_UNVERIFIABLE", "mission covers a class that is never eligible")
+        if "test" in m:
+            t = m["test"]; a = t.get("argv") if isinstance(t, dict) else None
+            if not (isinstance(t, dict) and set(t) == {"argv", "timeout_s"} and isinstance(a, list) and 2 <= len(a) <= 6 and a[0] in ("php", "python3") and all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9._/=-]{1,100}", x) for x in a)
+                    and not any(x.startswith("-") or x.startswith("/") or ".." in x.split("/") for x in a[1:]) and isinstance(t["timeout_s"], int) and 10 <= t["timeout_s"] <= 300
+                    and any(under(a[1], p) for p in m["allow_paths"])):
+                raise Refuse("REFUSED_UNVERIFIABLE", "mission test command is outside policy")
         iss, exp, now = parse_ts(m["issued_at"]), parse_ts(m["expires_at"]), parse_ts(self.now())
         if exp - iss > datetime.timedelta(days=self.cfg["max_validity_days"]) or exp <= iss: raise Refuse("REFUSED_UNVERIFIABLE", "validity window invalid")
         if now >= exp: raise Refuse("REFUSED_EXPIRED", "mission expired")
@@ -298,8 +309,14 @@ class Verifier:
             if not mt: raise Refuse("REFUSED_UNVERIFIABLE", "malformed submission name")
             handle, attempt = mt.group(1), int(mt.group(2))
             m, nonce_h, cand, real, base = self.verify_candidate(name, handle, attempt)
+            tests = None
+            if "test" in m:   # P3: candidate code is never run here; an isolated runner reports, and the result must bind to exactly this tree
+                if self.tester is None: raise Refuse("REFUSED_UNVERIFIABLE", "mission requires independent tests and no runner is configured")
+                tests = self.tester(self, m, cand, handle, attempt)
             self.promote(name, m, nonce_h, cand, real)
             v.update({"code": "ACCEPTED", "fixable": False, "reasons": [], "promoted": cand})
+            if tests: v["tests"] = tests
+        except Pending: return None   # no verdict yet
         except Refuse as e:
             v.update({"code": e.code, "fixable": e.fixable, "reasons": [e.reason[:600]]})
         except Exception as e:   # fail closed
