@@ -156,6 +156,9 @@ def verify_sig(data, sig, signers, namespace, principal="owner"):
     finally: shutil.rmtree(d, ignore_errors=True)
 
 class Verifier:
+    SCHEMAS = ("tpicc-mission-v1",); EXTRA_KEYS = frozenset()   # P5 hooks: the records profile widens these
+    def _exhausted(self, handle, rows): return any(r[1] == "complete" and r[2] == handle for r in rows)
+    def watch_paths(self, m): return m["footprint"] + m["allow_paths"] + [m["wo_path"]] + self.cfg["enforcement"]
     def __init__(self, work, real, ledger, scratch, anchor_path, anchor_pin, config=None, allow_file=False, now=None, records=None, log=print, tester=None):
         self.cfg = dict(DEFAULT_CONFIG); self.cfg.update(config or {})
         self.scratch = scratch; os.makedirs(scratch, exist_ok=True)
@@ -187,7 +190,8 @@ class Verifier:
         except Exception: raise Refuse("REFUSED_UNVERIFIABLE", "mission is not valid JSON")
         need = {"schema", "handle", "work_order", "wo_path", "wo_sha256", "risk", "baseline", "allow_paths", "allowed_ops", "footprint", "max_attempts", "nonce", "issued_at", "expires_at"}
         if isinstance(m, dict) and "test" in m: need = need | {"test"}   # P3: optional signed test command
-        if not isinstance(m, dict) or set(m) != need or m["schema"] != "tpicc-mission-v1" or m["handle"] != handle or m["risk"] not in ("R1", "R2"):
+        need = need | self.EXTRA_KEYS
+        if not isinstance(m, dict) or set(m) != need or m["schema"] not in self.SCHEMAS or m["handle"] != handle or m["risk"] not in ("R1", "R2"):
             raise Refuse("REFUSED_UNVERIFIABLE", "mission malformed or ineligible risk class")
         if not (isinstance(m["allow_paths"], list) and m["allow_paths"] and all(isinstance(x, str) for x in m["allow_paths"]) and isinstance(m["footprint"], list)
                 and isinstance(m["allowed_ops"], list) and set(m["allowed_ops"]) <= {"A", "M"} and isinstance(m["max_attempts"], int) and 0 < m["max_attempts"] <= 20
@@ -232,7 +236,7 @@ class Verifier:
         nonce_h = sha256(m["nonce"].encode())[:32]
         _, rows = self.ledger.state()
         if any(r[1] == "revoke" and r[2] == handle for r in rows): raise Refuse("REFUSED_REVOKED", "mission revoked")
-        if any(r[1] == "complete" and r[2] == handle for r in rows): raise Refuse("REFUSED_REPLAY", "mission already completed")
+        if self._exhausted(handle, rows): raise Refuse("REFUSED_REPLAY", "mission already completed")
         if any(r[1] == "claim" and r[3] == nonce_h and r[2] != handle for r in rows): raise Refuse("REFUSED_REPLAY", "nonce already used by another mission")
         if attempt > m["max_attempts"]: raise Refuse("REFUSED_ATTEMPTS", "attempt limit reached")
         cand = self.fetch(self.work, "refs/heads/submit/%s-%d" % (handle, attempt), "refs/cand/%s-%d" % (handle, attempt))
@@ -242,7 +246,7 @@ class Verifier:
         if sha256(wo) != m["wo_sha256"]: raise Refuse("REFUSED_UNVERIFIABLE", "work order digest does not match the baseline")
         # baseline rule: head descends from the signed baseline; a change to footprint/dependencies/enforcement files is material
         if not self.is_anc(base, real): raise Refuse("BASELINE_MATERIAL", "current head does not descend from the signed baseline")
-        watch = m["footprint"] + m["allow_paths"] + [m["wo_path"]] + self.cfg["enforcement"]
+        watch = self.watch_paths(m)
         moved = [p for c in self.changes(base, real) for p in c[3] if any(under(p, w) for w in watch)]
         if moved: raise Refuse("BASELINE_MATERIAL", "head changed signed-scope files: %d path(s)" % len(moved))
         if not self.is_anc(real, cand) or cand == real: raise Refuse("NEEDS_REBASE", "candidate is not a fast-forward of the current head", fixable=True)
@@ -269,7 +273,7 @@ class Verifier:
             mine = [r for r in rows if r[2] == handle]
             if not any(r[1] == "claim" for r in mine): raise Refuse("REFUSED_UNVERIFIABLE", "act without claim")
             if any(r[1] == "revoke" for r in mine): raise Refuse("REFUSED_REVOKED", "mission revoked")
-            if any(r[1] == "complete" for r in mine): raise Refuse("REFUSED_REPLAY", "mission already completed")
+            if self._exhausted(handle, rows): raise Refuse("REFUSED_REPLAY", "mission already completed")
             opened = [r for r in mine if r[1] == "act-intent"]; closed = [r for r in mine if r[1] in ("complete", "abort")]
             if len(opened) > len(closed): raise Refuse("REFUSED_UNVERIFIABLE", "an earlier act-intent is still open")
         return self.ledger.append("act-intent", handle, nonce_h, "promote", digest, check=intent_chk)
